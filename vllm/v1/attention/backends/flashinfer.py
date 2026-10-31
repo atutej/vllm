@@ -68,6 +68,9 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.grug_logical_kv import (
+    trtllm_decode_with_query_groups,
+)
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_flashinfer_layout_string,
@@ -1821,6 +1824,7 @@ class FlashInferImpl(AttentionImpl):
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.decode_query_head_groups = 1
 
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
@@ -2533,7 +2537,13 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
-                trtllm_batch_decode_with_kv_cache(
+                decode = trtllm_batch_decode_with_kv_cache
+                if self.decode_query_head_groups != 1 and num_decode_tokens > 0:
+                    decode = partial(
+                        trtllm_decode_with_query_groups,
+                        groups=self.decode_query_head_groups,
+                    )
+                decode(
                     query=decode_query,
                     kv_cache=(
                         nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple

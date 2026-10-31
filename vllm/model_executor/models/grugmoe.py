@@ -972,6 +972,19 @@ class GrugMoeAttention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_type=AttentionType.DECODER,
         )
+        if (
+            cfg.logical_kv_cache
+            and is_global
+            and self.cache_kv_heads < cfg.num_kv_heads
+            and self.attn.attn_backend.get_name() == "FLASHINFER"
+        ):
+            # FlashInfer is optional on other platforms and backend choices.
+            from vllm.v1.attention.backends.flashinfer import FlashInferImpl
+
+            assert isinstance(self.attn.impl, FlashInferImpl)
+            self.attn.impl.decode_query_head_groups = (
+                cfg.num_kv_heads // self.cache_kv_heads
+            )
 
     def apply_xsa(
         self,
