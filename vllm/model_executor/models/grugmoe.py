@@ -79,6 +79,7 @@ _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
 _UNQUANTIZED_METHOD = "unquantized"
 _HERO_ARTIFACT_SCHEMA_VERSION = 2
 _SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
+_LOGICAL_KV_HEAD_GEOMETRY = (48, 12, 6, 128)
 
 
 def _config_attr(config: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -978,10 +979,13 @@ class GrugMoeAttention(nn.Module):
             and self.cache_kv_heads < cfg.num_kv_heads
         ):
             if (
-                cfg.num_heads != 48
-                or cfg.num_kv_heads != 12
-                or self.cache_kv_heads != 6
-                or self.head_dim != 128
+                (
+                    cfg.num_heads,
+                    cfg.num_kv_heads,
+                    self.cache_kv_heads,
+                    self.head_dim,
+                )
+                != _LOGICAL_KV_HEAD_GEOMETRY
                 or self.attn.attn_backend.get_name() != "FLASHINFER"
             ):
                 raise NotImplementedError(
@@ -1184,11 +1188,14 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 raise NotImplementedError("Logical GrugMoE KV cache requires TP=1")
             if logical_kv_cache and (
                 not self.config.is_hero
-                or self.config.num_heads != 48
-                or self.config.num_kv_heads != 12
-                or self.config.local_kv_heads != 12
-                or self.config.global_kv_heads != 6
-                or self.config.inferred_head_dim != 128
+                or (
+                    self.config.num_heads,
+                    self.config.num_kv_heads,
+                    self.config.global_kv_heads,
+                    self.config.inferred_head_dim,
+                )
+                != _LOGICAL_KV_HEAD_GEOMETRY
+                or self.config.local_kv_heads != self.config.num_kv_heads
                 or vllm_config.model_config.dtype != torch.bfloat16
                 or vllm_config.cache_config.cache_dtype != "auto"
                 or vllm_config.quant_config is not None

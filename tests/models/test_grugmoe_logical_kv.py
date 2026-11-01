@@ -4,7 +4,11 @@
 import pytest
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
+
+HEAD_SIZE = 128
+KV_WIDTH = 2 * HEAD_SIZE
 
 
 def _paged_history(
@@ -14,10 +18,12 @@ def _paged_history(
     pages = (length + page_size - 1) // page_size
     repeated = history.repeat_interleave(heads // history.shape[1], dim=1)
     padded = torch.zeros(
-        pages * page_size, heads, 256, dtype=torch.bfloat16, device="cuda"
+        pages * page_size, heads, KV_WIDTH, dtype=torch.bfloat16, device="cuda"
     )
     padded[:length] = repeated
-    return padded.reshape(pages, page_size, heads, 256).transpose(1, 2).contiguous()
+    return (
+        padded.reshape(pages, page_size, heads, KV_WIDTH).transpose(1, 2).contiguous()
+    )
 
 
 @pytest.mark.skipif(
@@ -32,7 +38,6 @@ def test_grouped_decode_preserves_repeated_heads(
     pytest.importorskip("flashinfer")
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
-    from vllm import envs
     from vllm.v1.attention.backends.grug_logical_kv import (
         trtllm_decode_with_query_groups,
     )
@@ -42,13 +47,13 @@ def test_grouped_decode_preserves_repeated_heads(
     histories = torch.randn(
         length + 32 * batch,
         6,
-        256,
+        KV_WIDTH,
         dtype=torch.bfloat16,
         device="cuda",
         generator=generator,
     )
     query = torch.randn(
-        batch, 48, 128, dtype=torch.bfloat16, device="cuda", generator=generator
+        batch, 48, HEAD_SIZE, dtype=torch.bfloat16, device="cuda", generator=generator
     )
     lengths = [length - (index % 8) * 37 for index in range(batch)]
     workspace = torch.zeros(
@@ -66,12 +71,12 @@ def test_grouped_decode_preserves_repeated_heads(
         output = torch.empty_like(query)
         options = dict(
             query=query,
-            kv_cache=cache.split(128, dim=-1),
+            kv_cache=cache.split(HEAD_SIZE, dim=-1),
             workspace_buffer=workspace,
             block_tables=block_tables,
             seq_lens=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
             max_seq_len=length,
-            bmm1_scale=128**-0.5,
+            bmm1_scale=HEAD_SIZE**-0.5,
             bmm2_scale=1.0,
             window_left=-1,
             sinks=None,
@@ -96,10 +101,14 @@ def test_grouped_decode_preserves_repeated_heads(
     head = torch.arange(48, device="cuda") // 8
     for index, seq_len in enumerate(lengths):
         history = histories[index * 32 : index * 32 + seq_len]
-        keys = history[:, head, :128].float().transpose(0, 1)
+        keys = history[:, head, :HEAD_SIZE].float().transpose(0, 1)
         scores = query[index].float()[:, None] @ keys.transpose(1, 2)
         del keys
-        values = history[:, head, 128:].float().transpose(0, 1)
-        expected = (torch.softmax(scores * (128**-0.5), dim=-1) @ values).squeeze(1)
-        torch.testing.assert_close(outputs[1][index].float(), expected, atol=0.01, rtol=0.01)
+        values = history[:, head, HEAD_SIZE:].float().transpose(0, 1)
+        expected = (
+            torch.softmax(scores * (HEAD_SIZE**-0.5), dim=-1) @ values
+        ).squeeze(1)
+        torch.testing.assert_close(
+            outputs[1][index].float(), expected, atol=0.01, rtol=0.01
+        )
         del values, scores, expected
