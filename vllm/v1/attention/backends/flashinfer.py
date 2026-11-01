@@ -2001,6 +2001,14 @@ class FlashInferImpl(AttentionImpl):
         decode_with_xqa = decode_kernel == FlashInferDecodeKernel.XQA
         decode_with_trtllm_gen = decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
         decode_with_flashinfer_trtllm_api = decode_with_xqa or decode_with_trtllm_gen
+        if self.decode_query_head_groups != 1 and (
+            (attn_metadata.num_prefill_tokens > 0 and not prefill_use_trtllm)
+            or (attn_metadata.num_decode_tokens > 0 and not decode_with_trtllm_gen)
+        ):
+            raise NotImplementedError(
+                "Grouped logical KV heads require TRTLLM prefill and "
+                "trtllm-gen decode"
+            )
 
         # The attn+quant fusion happens when output_scale is provided.
         if output_scale is None:

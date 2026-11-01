@@ -976,8 +976,19 @@ class GrugMoeAttention(nn.Module):
             cfg.logical_kv_cache
             and is_global
             and self.cache_kv_heads < cfg.num_kv_heads
-            and self.attn.attn_backend.get_name() == "FLASHINFER"
         ):
+            if (
+                cfg.num_heads != 48
+                or cfg.num_kv_heads != 12
+                or self.cache_kv_heads != 6
+                or self.head_dim != 128
+                or self.attn.attn_backend.get_name() != "FLASHINFER"
+            ):
+                raise NotImplementedError(
+                    "Logical GrugMoE KV cache requires FlashInfer with "
+                    "48 query heads, 12 repeated KV heads and 6 stored KV "
+                    "heads of size 128"
+                )
             # FlashInfer is optional on other platforms and backend choices.
             from vllm.v1.attention.backends.flashinfer import FlashInferImpl
 
@@ -1171,6 +1182,24 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 raise ValueError("grug_logical_kv_cache must be a boolean")
             if logical_kv_cache and get_tensor_model_parallel_world_size() != 1:
                 raise NotImplementedError("Logical GrugMoE KV cache requires TP=1")
+            if logical_kv_cache and (
+                not self.config.is_hero
+                or self.config.num_heads != 48
+                or self.config.num_kv_heads != 12
+                or self.config.local_kv_heads != 12
+                or self.config.global_kv_heads != 6
+                or self.config.inferred_head_dim != 128
+                or vllm_config.model_config.dtype != torch.bfloat16
+                or vllm_config.cache_config.cache_dtype != "auto"
+                or vllm_config.quant_config is not None
+                or vllm_config.parallel_config.pipeline_parallel_size != 1
+                or not current_platform.is_cuda()
+                or not current_platform.is_device_capability(100)
+            ):
+                raise NotImplementedError(
+                    "Logical GrugMoE KV cache requires unquantized BF16 Hero-535B "
+                    "with native KV precision, PP=1 and SM100 CUDA"
+                )
             self.config = replace(self.config, logical_kv_cache=logical_kv_cache)
         if not self.config.disable_pko:
             raise NotImplementedError(
