@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import AutoConfig
+
+from tests.utils import ensure_current_vllm_config
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -23,15 +25,9 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.engine.arg_utils import EngineArgs
-from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.transformers_utils.config import get_config
-from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
-from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
-from vllm.v1.worker.workspace import init_workspace_manager
-
-from tests.utils import ensure_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
     _ROUTER_COMBINE_WEIGHT_SUM,
@@ -48,6 +44,10 @@ from vllm.model_executor.models.grugmoe import (
     get_grug_moe_runtime_info,
 )
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.transformers_utils.config import get_config
+from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
+from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
+from vllm.v1.worker.workspace import init_workspace_manager
 
 
 @pytest.fixture(autouse=True)
