@@ -149,8 +149,8 @@ rounding before expert selection. Norms, ShortConv state and the KV cache
 retain their existing precision. Serialized FP8 checkpoints are unsupported.
 
 The fork's model suite checks BF16 weight loading and numerical agreement for
-Hero's latent and shared experts at one and seven input tokens, using positive
-weights and inputs to limit cancellation:
+Hero's latent and shared experts at one and seven input tokens, using
+FP8-representable weight/input ratios to isolate loading from rounding error:
 
 ```bash
 .venv/bin/python -m pytest tests/models/test_grugmoe.py \

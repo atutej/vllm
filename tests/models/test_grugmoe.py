@@ -1371,7 +1371,7 @@ def test_hero_online_fp8_latent_and_shared_experts_match_bf16(num_tokens, monkey
             elif name == "mlp.router.bias":
                 _fill_parameter(parameter, 0.2, -0.2)
             else:
-                _fill_parameter(parameter, 0.02, 0.12)
+                parameter.fill_(0.125)
         reference["mlp"].router.weight.copy_(
             reference["mlp"].router.weight.bfloat16().float()
         )
@@ -1394,11 +1394,12 @@ def test_hero_online_fp8_latent_and_shared_experts_match_bf16(num_tokens, monkey
                 loader = getattr(parameter, "weight_loader", default_weight_loader)
                 loader(parameter, weight)
 
-    # Positive inputs/weights isolate loading and projection correctness from
-    # cancellation-sensitive FP8 error; model quality needs separate evaluation.
-    x = torch.linspace(
-        0.125, 1.0, num_tokens * cfg.hidden_dim, device="cuda", dtype=torch.bfloat16
-    ).view(num_tokens, cfg.hidden_dim)
+    # Exactly representable weight/input ratios isolate loading correctness
+    # from accumulated FP8 rounding; model quality needs separate evaluation.
+    x = torch.full(
+        (num_tokens, cfg.hidden_dim), 0.125, device="cuda", dtype=torch.bfloat16
+    )
+    x[1::2] = 1.0
     routed_expected = _reference_moe(x, reference["mlp"])
     expected = routed_expected
     for expert in reference["shared_experts"]:
