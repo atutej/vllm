@@ -14,8 +14,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import AutoConfig
-
-from tests.utils import ensure_current_vllm_config
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -25,9 +23,15 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.transformers_utils.config import get_config
+from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
+from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
+from vllm.v1.worker.workspace import init_workspace_manager
+
+from tests.utils import ensure_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
     _ROUTER_COMBINE_WEIGHT_SUM,
@@ -44,10 +48,6 @@ from vllm.model_executor.models.grugmoe import (
     get_grug_moe_runtime_info,
 )
 from vllm.model_executor.models.registry import ModelRegistry
-from vllm.transformers_utils.config import get_config
-from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
-from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
-from vllm.v1.worker.workspace import init_workspace_manager
 
 
 @pytest.fixture(autouse=True)
@@ -1291,15 +1291,17 @@ def test_grug_moe_online_fp8_matches_bf16_reference(monkeypatch):
         "model_config",
         SimpleNamespace(dtype=torch.bfloat16),
     )
-    quantized = GrugMoeMLP(
-        cfg,
-        params_dtype=torch.bfloat16,
-        quant_config=Fp8Config(),
-        prefix="model.layers.0.mlp",
-    )
+    # Online weight loading captures this device before it quantizes the experts.
+    with torch.device("cuda"):
+        quantized = GrugMoeMLP(
+            cfg,
+            params_dtype=torch.bfloat16,
+            quant_config=Fp8Config(),
+            prefix="model.layers.0.mlp",
+        )
     with torch.no_grad():
-        quantized.router.weight.copy_(reference.router.weight.cpu())
-        quantized.router.bias.copy_(reference.router.bias.cpu())
+        quantized.router.weight.copy_(reference.router.weight)
+        quantized.router.bias.copy_(reference.router.bias)
         params_dict = dict(quantized.named_parameters())
         for projection, weight in (
             ("gate_proj", experts.w13_weight[:, : cfg.intermediate_dim]),
@@ -1309,8 +1311,6 @@ def test_grug_moe_online_fp8_matches_bf16_reference(monkeypatch):
             _try_load_grug_expert_weight(
                 f"experts.{projection}.weight", weight, params_dict
             )
-    quantized.cuda()
-
     init_workspace_manager(torch.device("cuda"))
     with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
         actual = quantized(x)
