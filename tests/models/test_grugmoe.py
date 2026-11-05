@@ -208,40 +208,31 @@ def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
     return out.to(x.dtype).reshape_as(x)
 
 
+def _round_to_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Round through tensorwise FP8 and return dequantized FP32 values."""
+    quantized, scale = ref_dynamic_per_tensor_fp8_quant(x)
+    return quantized.float() * scale
+
+
 def _reference_fp8_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
     """Tensorwise FP8 reference from the original BF16 expert weights."""
     assert module.latent_down_proj is None
     x_flat = x.reshape(-1, x.shape[-1])
     combine_weights, selected = _reference_routing(x_flat, module)
     experts = module.experts.routed_experts
-    w13_parts, w13_scales = zip(
-        *(ref_dynamic_per_tensor_fp8_quant(w) for w in experts.w13_weight)
-    )
-    w2_parts, w2_scales = zip(
-        *(ref_dynamic_per_tensor_fp8_quant(w) for w in experts.w2_weight)
-    )
-    w13 = torch.stack(w13_parts).float()
-    w2 = torch.stack(w2_parts).float()
-    w13_scale = torch.stack(w13_scales).flatten()
-    w2_scale = torch.stack(w2_scales).flatten()
-    inputs, input_scale = ref_dynamic_per_tensor_fp8_quant(x_flat)
+    gate_up_weights = torch.stack([_round_to_fp8(w) for w in experts.w13_weight])
+    down_weights = torch.stack([_round_to_fp8(w) for w in experts.w2_weight])
 
-    gate_up = torch.einsum("td,tkid->tki", inputs.float(), w13[selected])
-    gate_up = (
-        gate_up * input_scale * w13_scale[selected].unsqueeze(-1)
+    gate_up = torch.einsum(
+        "td,tkid->tki", _round_to_fp8(x_flat), gate_up_weights[selected]
     ).to(x.dtype)
     gate, up = gate_up.chunk(2, dim=-1)
     # The fused activation rounds once after SiLU and multiplication.
     hidden = (F.silu(gate.float()) * up.float()).to(x.dtype)
-    hidden, hidden_scale = ref_dynamic_per_tensor_fp8_quant(hidden)
-    out = torch.einsum("tki,tkdi->tkd", hidden.float(), w2[selected])
-    # Routing weights are applied before the kernel stores its BF16 result.
-    out = (
-        out
-        * hidden_scale
-        * w2_scale[selected].unsqueeze(-1)
-        * combine_weights.unsqueeze(-1)
-    ).to(x.dtype)
+    out = torch.einsum(
+        "tki,tkdi->tkd", _round_to_fp8(hidden), down_weights[selected]
+    )
+    out = (out * combine_weights.unsqueeze(-1)).to(x.dtype)
     return out.sum(dim=1).reshape_as(x)
 
 
@@ -1326,6 +1317,9 @@ def test_grug_moe_online_fp8_matches_quantized_reference(monkeypatch, num_tokens
         _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
         _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
         _fill_parameter(experts.w2_weight, -0.1, 0.1)
+        # Distinct expert scales make accidental scale sharing observable.
+        experts.w13_weight[0].mul_(1.5)
+        experts.w2_weight[0].mul_(0.75)
 
     x = torch.linspace(-0.6, 0.7, num_tokens * cfg.hidden_dim, device="cuda").reshape(
         num_tokens, cfg.hidden_dim
@@ -1361,9 +1355,11 @@ def test_grug_moe_online_fp8_matches_quantized_reference(monkeypatch, num_tokens
     with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
         actual = quantized(x)
 
-    # FP8 rounding is in the reference; use the BF16 comparison defaults for
-    # the remaining intermediate and output arithmetic.
-    torch.testing.assert_close(actual, expected)
+    # The reference includes FP8 rounding. Require agreement within one BF16
+    # epsilon for the remaining arithmetic, with no absolute-error allowance.
+    torch.testing.assert_close(
+        actual, expected, rtol=torch.finfo(torch.bfloat16).eps, atol=0
+    )
 
 
 def test_grug_moe_router_selects_logical_expert_ids():
