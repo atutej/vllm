@@ -3,6 +3,7 @@
 
 import contextlib
 import json
+import math
 import os
 import tempfile
 from dataclasses import replace
@@ -15,7 +16,11 @@ from torch import nn
 from transformers import AutoConfig
 
 from tests.utils import ensure_current_vllm_config
-from vllm.config import CUDAGraphMode, get_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    get_current_vllm_config,
+    set_current_vllm_config,
+)
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -25,6 +30,11 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+from vllm.model_executor.model_loader.reload.meta import materialize_layer
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
     _ROUTER_COMBINE_WEIGHT_SUM,
@@ -43,6 +53,7 @@ from vllm.model_executor.models.grugmoe import (
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -149,7 +160,12 @@ def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
             F.linear(x_flat, module.latent_down_proj.weight),
             module.latent_norm,
         )
-    router_logits = F.linear(x_flat.float(), module.router.weight.float())
+    if cfg.is_hero:
+        router_logits = F.linear(
+            x_flat, module.router.weight.to(x_flat.dtype)
+        ).float()
+    else:
+        router_logits = F.linear(x_flat.float(), module.router.weight.float())
     _, top_indices = torch.topk(
         router_logits + module.router.bias.float(),
         k=cfg.num_experts_per_token + 1,
@@ -482,10 +498,72 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
         "sliding_attention",
         "full_attention",
     ]
-    assert runtime_config == _tiny_hero_config()
+    assert runtime_config == replace(
+        _tiny_hero_config(),
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+        },
+    )
     assert vllm_config.model_config.is_hybrid is True
     assert vllm_config.model_config.has_inner_state is True
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
+    reason="Logical Hero KV caching is qualified on SM100",
+)
+@pytest.mark.parametrize(
+    "additional_config,backend,trtllm,quantization,global_heads",
+    [
+        ({}, "FLASHINFER", None, None, 6),
+        ({"grug_logical_kv_cache": True}, "FLASHINFER", True, None, 6),
+        ({"grug_logical_kv_cache": False}, "FLASHINFER", None, None, 12),
+        ({}, "TRITON_ATTN", None, None, 12),
+        ({}, "FLASHINFER", False, None, 12),
+        ({}, "FLASHINFER", None, "fp8", 12),
+    ],
+)
+def test_hero_cache_default_preserves_unqualified_layouts(
+    tmp_path, additional_config, backend, trtllm, quantization, global_heads
+):
+    # Keep Hero's head geometry while making model construction inexpensive.
+    GrugMoeConfig(
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        num_hidden_layers=2,
+        num_attention_heads=48,
+        num_key_value_heads=12,
+        local_kv_heads=12,
+        global_kv_heads=6,
+        head_dim=128,
+        max_position_embeddings=4096,
+        sliding_window=128,
+        grugmoe_artifact_schema_version=2,
+    ).save_pretrained(tmp_path)
+    vllm_config = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        quantization=quantization,
+        additional_config=additional_config,
+        attention_config={"backend": backend, "use_trtllm_attention": trtllm},
+    ).create_engine_config()
+    with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
+        model = GrugMoeModel(vllm_config=vllm_config)
+        specs = [
+            layer.self_attn.attn.get_kv_cache_spec(vllm_config)
+            for layer in model.layers
+        ]
+    assert [spec.num_kv_heads for spec in specs] == [12, global_heads]
+    assert specs[1].page_size_bytes == (
+        2 * vllm_config.cache_config.block_size * global_heads * 128 * 2
+    )
 
 
 def test_grug_moe_config_rejects_noncanonical_layer_types():
@@ -594,11 +672,16 @@ def _minimal_vllm_config_for_mode_check(
     *,
     tensor_parallel_size=1,
     quantization_method=None,
+    is_checkpoint_fp8_serialized=False,
 ):
     quant_config = (
         None
         if quantization_method is None
-        else SimpleNamespace(get_name=lambda: quantization_method)
+        else (
+            Fp8Config(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+            if quantization_method == "fp8"
+            else SimpleNamespace(get_name=lambda: quantization_method)
+        )
     )
     return SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=tensor_parallel_size),
@@ -627,29 +710,33 @@ def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("is_tpu", "quantization_method", "supported"),
+    ("is_tpu", "quantization_method", "serialized", "supported"),
     [
-        (True, "unquantized", True),
-        (True, "fp8", False),
-        (False, "unquantized", False),
+        (True, "unquantized", False, True),
+        (True, "fp8", False, False),
+        (False, "unquantized", False, False),
+        (False, "fp8", False, True),
+        (False, "fp8", True, False),
     ],
 )
-def test_grug_moe_tpu_accepts_only_unquantized_backend(
+def test_grug_moe_quantization_platform_support(
     monkeypatch,
     is_tpu,
     quantization_method,
+    serialized,
     supported,
 ):
     fake_config = _minimal_vllm_config_for_mode_check(
         tensor_parallel_size=8 if is_tpu else 1,
         quantization_method=quantization_method,
+        is_checkpoint_fp8_serialized=serialized,
     )
     _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=is_tpu)
 
     if supported:
         _raise_for_unsupported_modes(fake_config)
     else:
-        with pytest.raises(NotImplementedError, match="does not support quantization"):
+        with pytest.raises(NotImplementedError, match="supports only online FP8"):
             _raise_for_unsupported_modes(fake_config)
 
 
@@ -989,7 +1076,8 @@ def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type(logical_kv_cache):
     torch.testing.assert_close(global_capture.v, v)
 
 
-def test_grug_moe_attention_schedule_matches_training_architecture():
+@pytest.mark.parametrize("use_yarn", [False, True])
+def test_grug_moe_attention_schedule_matches_training_architecture(use_yarn):
     cfg = GrugMoeRuntimeConfig(
         vocab_size=32,
         hidden_dim=8,
@@ -1008,6 +1096,20 @@ def test_grug_moe_attention_schedule_matches_training_architecture():
         disable_pko=True,
         disable_long_rope=True,
     ).validate()
+
+    if use_yarn:
+        cfg = replace(
+            cfg,
+            max_seq_len=65536,
+            rope_parameters={
+                "rope_type": "yarn",
+                "rope_theta": cfg.rope_theta,
+                "partial_rotary_factor": 0.5,
+                "factor": 4.0,
+                "original_max_position_embeddings": 16384,
+                "attention_factor": 1.0 + 0.1 * math.log(4.0),
+            },
+        )
 
     short_layer = GrugMoeDecoderLayer(
         cfg,
@@ -1165,8 +1267,10 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_grug_moe_cuda_accepts_bf16_expert_weights():
+@pytest.mark.parametrize("hero_profile", [False, True])
+def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
     cfg = GrugMoeRuntimeConfig(
+        artifact_schema_version=2 if hero_profile else 1,
         vocab_size=64,
         hidden_dim=16,
         intermediate_dim=16,
@@ -1196,6 +1300,8 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights():
 
     with torch.no_grad():
         _fill_parameter(mlp.router.weight, -0.35, 0.4)
+        if hero_profile:
+            mlp.router.weight.copy_(mlp.router.weight.bfloat16().float())
         _fill_parameter(mlp.router.bias, 0.25, -0.15)
         routed_experts = mlp.experts.routed_experts
         _fill_parameter(
@@ -1222,6 +1328,75 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights():
     assert actual.dtype == torch.bfloat16
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
+    cfg = replace(
+        _tiny_config(),
+        hidden_dim=64,
+        intermediate_dim=64,
+        num_heads=4,
+        head_dim=16,
+    ).validate()
+    monkeypatch.setattr(
+        get_current_vllm_config(),
+        "model_config",
+        SimpleNamespace(dtype=torch.bfloat16),
+    )
+    # Online weight loading captures this device before it quantizes the experts.
+    with torch.device("cuda"):
+        quantized = GrugMoeMLP(
+            cfg,
+            params_dtype=torch.bfloat16,
+            quant_config=Fp8Config(),
+            prefix="model.layers.0.mlp",
+        )
+        # Direct vLLM weights bypass Grug's checkpoint mapping.
+        reference = FusedMoEFactory(
+            num_experts=cfg.num_experts,
+            top_k=cfg.num_experts_per_token,
+            hidden_size=cfg.hidden_dim,
+            intermediate_size=cfg.intermediate_dim,
+            params_dtype=torch.bfloat16,
+            renormalize=False,
+            quant_config=Fp8Config(),
+            prefix="reference.experts",
+            router=GrugMoeRouter(
+                top_k=cfg.num_experts_per_token,
+                global_num_experts=cfg.num_experts,
+                bias=quantized.router.bias,
+            ),
+            router_logits_dtype=torch.float32,
+        )
+    with torch.no_grad():
+        _fill_parameter(quantized.router.weight, -0.1, 0.1)
+        _fill_parameter(quantized.router.bias, 0.2, -0.2)
+        experts = reference.routed_experts
+        materialize_layer(experts, get_layerwise_info(experts))
+        _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
+        _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
+        _fill_parameter(experts.w2_weight, -0.1, 0.1)
+        params_dict = dict(quantized.named_parameters())
+        for projection, weight in (
+            ("gate_proj", experts.w13_weight[:, : cfg.intermediate_dim]),
+            ("up_proj", experts.w13_weight[:, cfg.intermediate_dim :]),
+            ("down_proj", experts.w2_weight),
+        ):
+            _try_load_grug_expert_weight(
+                f"experts.{projection}.weight", weight, params_dict
+            )
+        experts.quant_method.process_weights_after_loading(experts)
+
+    x = torch.linspace(-0.6, 0.7, 3 * cfg.hidden_dim, device="cuda").reshape(
+        3, cfg.hidden_dim
+    ).to(torch.bfloat16)
+    init_workspace_manager(torch.device("cuda"))
+    with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
+        expected = reference(x, F.linear(x.float(), quantized.router.weight))
+        actual = quantized(x)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_grug_moe_router_selects_logical_expert_ids():
@@ -1439,3 +1614,96 @@ def test_grug_moe_registry_imports():
 
     assert model_cls is not None
     assert model_cls.__name__ == "GrugMoeForCausalLM"
+
+
+@pytest.mark.parametrize("rope_fused", [True, False])
+def test_hero_yarn_config_roundtrip_and_partial_rotation_at_65k(rope_fused):
+    scaling = {
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 16384,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "mscale": 1.0,
+        "attention_factor": 1.0 + 0.1 * math.log(4.0),
+    }
+    config = GrugMoeConfig(
+        vocab_size=32,
+        hidden_size=128,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=128,
+        max_position_embeddings=65536,
+        grugmoe_artifact_schema_version=2,
+        rope_fused=rope_fused,
+        rope_theta=10000.0,
+        rope_scaling=scaling,
+        partial_rotary_factor=0.5,
+    )
+    config = GrugMoeConfig.from_dict(config.to_dict())
+    cfg = GrugMoeRuntimeConfig.from_hf_config(config)
+    rotary = get_rope(
+        cfg.inferred_head_dim,
+        max_position=cfg.max_seq_len,
+        rope_parameters=cfg.rope_parameters,
+        is_neox_style=not cfg.rope_fused,
+        dtype=torch.float32,
+    )
+    positions = torch.tensor([0, 16383, 32767, 65535])
+    query = torch.linspace(-0.5, 0.5, 4 * 128).reshape(4, 128)
+    actual, actual_key = rotary.forward_native(positions, query, query)
+
+    # Independent complex rotation in float64. The production cache computes
+    # phases in float32; at 65K its phase quantization contributes up to 0.002.
+    rotary_dim = 64
+    indices = torch.arange(rotary_dim // 2, dtype=torch.float64)
+    low = max(
+        math.floor(
+            rotary_dim * math.log(16384 / (32 * 2 * math.pi)) / (2 * math.log(10000))
+        ),
+        0,
+    )
+    high = min(
+        math.ceil(
+            rotary_dim * math.log(16384 / (2 * math.pi)) / (2 * math.log(10000))
+        ),
+        rotary_dim - 1,
+    )
+    ramp = ((indices - low) / (high - low)).clamp(0, 1)
+    inverse_frequency = torch.pow(10000.0, -2 * indices / rotary_dim) * (
+        1 - ramp + ramp / 4
+    )
+    phase = positions.double()[:, None] * inverse_frequency[None, :]
+    rotated = query[:, :rotary_dim].double()
+    if rope_fused:
+        pairs = torch.complex(rotated[:, 0::2], rotated[:, 1::2])
+    else:
+        pairs = torch.complex(rotated[:, :32], rotated[:, 32:])
+    result = pairs * torch.polar(
+        torch.full_like(phase, scaling["attention_factor"]), phase
+    )
+    expected = query.double().clone()
+    if rope_fused:
+        expected[:, :rotary_dim] = torch.stack(
+            (result.real, result.imag), dim=-1
+        ).flatten(-2)
+    else:
+        expected[:, :rotary_dim] = torch.cat((result.real, result.imag), dim=-1)
+    torch.testing.assert_close(actual.double(), expected, atol=0.003, rtol=0)
+    torch.testing.assert_close(actual_key, actual)
+    torch.testing.assert_close(actual[:, 64:], query[:, 64:], atol=0, rtol=0)
+
+
+def test_hero_yarn_rejects_full_dimension_amplitude_rescaling():
+    # DeepSeek's all-dimension temperature convention would alter Hero's
+    # unrotated half; importing it silently must fail at the config boundary.
+    with pytest.raises(ValueError, match="partial Q/K amplitude"):
+        GrugMoeConfig(
+            max_position_embeddings=65536,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 16384,
+                "mscale_all_dim": 1.0,
+            },
+        )

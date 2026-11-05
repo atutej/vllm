@@ -36,6 +36,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -54,12 +55,14 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.grugmoe import (
     grug_moe_layer_types,
+    grug_moe_rope_parameters,
     grug_moe_rope_theta,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
+from vllm.v1.attention.selector import get_attn_backend
 
 from .interfaces import (
     EagleModelMixin,
@@ -234,6 +237,7 @@ class GrugMoeRuntimeConfig:
     sconv_sites: tuple[str, ...] = ("k", "attn", "mlp")
     tie_word_embeddings: bool = False
     rope_theta: float = 10000.0
+    rope_parameters: dict[str, Any] | None = None
 
     @classmethod
     def from_hf_config(cls, config: Any) -> "GrugMoeRuntimeConfig":
@@ -317,6 +321,7 @@ class GrugMoeRuntimeConfig:
                 _config_attr(config, ("tie_word_embeddings",), False)
             ),
             rope_theta=grug_moe_rope_theta(config),
+            rope_parameters=grug_moe_rope_parameters(config),
         ).validate()
 
     @property
@@ -596,7 +601,7 @@ class GrugMoeMLP(nn.Module):
             cfg.num_experts,
             bias=True,
             params_dtype=torch.float32,
-            quant_config=quant_config,
+            quant_config=None if isinstance(quant_config, Fp8Config) else quant_config,
             disable_tp=True,
             skip_bias_add=True,
             prefix=f"{prefix}.router",
@@ -660,12 +665,20 @@ class GrugMoeMLP(nn.Module):
             return routed_output
         return _apply_grug_linear(self.latent_up_proj, routed_output)
 
+    def _router_logits(self, x: torch.Tensor) -> torch.Tensor:
+        logits = _apply_grug_linear(self.router, x.float())
+        if self.cfg.is_hero:
+            # Native Hero's dot has the hidden dtype, then casts to FP32 for
+            # QB bias/top-k. Round before adding the independently FP32 bias.
+            return logits.to(x.dtype).float()
+        return logits
+
     def _forward_torch_reference(
         self,
         x_flat: torch.Tensor,
         routed_input: torch.Tensor,
     ) -> torch.Tensor:
-        router_logits = _apply_grug_linear(self.router, x_flat.float())
+        router_logits = self._router_logits(x_flat)
         combine_weights, selected = self.experts.router.select_experts(
             hidden_states=x_flat,
             router_logits=router_logits,
@@ -712,7 +725,7 @@ class GrugMoeMLP(nn.Module):
         if not x_flat.is_cuda and not current_platform.is_tpu():
             out = self._forward_torch_reference(x_flat, routed_input)
             return out.to(x.dtype).reshape(orig_shape)
-        router_logits = _apply_grug_linear(self.router, x_flat.float())
+        router_logits = self._router_logits(x_flat)
         out = self.experts(
             hidden_states=routed_input,
             router_logits=router_logits,
@@ -956,7 +969,7 @@ class GrugMoeAttention(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=cfg.max_seq_len,
-            rope_parameters={
+            rope_parameters=cfg.rope_parameters or {
                 "rope_theta": cfg.rope_theta,
                 "partial_rotary_factor": 0.5,
             },
@@ -1181,33 +1194,53 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
         additional_config = vllm_config.additional_config
         if isinstance(additional_config, dict):
-            logical_kv_cache = additional_config.get("grug_logical_kv_cache", False)
-            if not isinstance(logical_kv_cache, bool):
+            logical_kv_cache = additional_config.get("grug_logical_kv_cache")
+            if "grug_logical_kv_cache" in additional_config and not isinstance(
+                logical_kv_cache, bool
+            ):
                 raise ValueError("grug_logical_kv_cache must be a boolean")
-            if logical_kv_cache and get_tensor_model_parallel_world_size() != 1:
-                raise NotImplementedError("Logical GrugMoE KV cache requires TP=1")
-            if logical_kv_cache and (
-                not self.config.is_hero
-                or (
+            eligible = (
+                self.config.is_hero
+                and (
                     self.config.num_heads,
                     self.config.num_kv_heads,
                     self.config.global_kv_heads,
                     self.config.inferred_head_dim,
                 )
-                != _LOGICAL_KV_HEAD_GEOMETRY
-                or self.config.local_kv_heads != self.config.num_kv_heads
-                or vllm_config.model_config.dtype != torch.bfloat16
-                or vllm_config.cache_config.cache_dtype != "auto"
-                or vllm_config.quant_config is not None
-                or vllm_config.parallel_config.pipeline_parallel_size != 1
-                or not current_platform.is_cuda()
-                or not current_platform.is_device_capability(100)
-            ):
+                == _LOGICAL_KV_HEAD_GEOMETRY
+                and self.config.local_kv_heads == self.config.num_kv_heads
+                and vllm_config.model_config.dtype == torch.bfloat16
+                and vllm_config.cache_config.cache_dtype == "auto"
+                and vllm_config.quant_config is None
+                and get_tensor_model_parallel_world_size() == 1
+                and vllm_config.parallel_config.pipeline_parallel_size == 1
+                and vllm_config.speculative_config is None
+                and vllm_config.attention_config.use_trtllm_attention is not False
+                and current_platform.is_cuda()
+                and current_platform.is_device_capability(100)
+            )
+            if eligible and logical_kv_cache is not False:
+                # Use the native selector, including per-cache-group overrides.
+                eligible = (
+                    get_attn_backend(
+                        self.config.inferred_head_dim,
+                        vllm_config.model_config.dtype,
+                        vllm_config.cache_config.cache_dtype,
+                    ).get_name()
+                    == "FLASHINFER"
+                )
+            if logical_kv_cache and not eligible:
                 raise NotImplementedError(
                     "Logical GrugMoE KV cache requires unquantized BF16 Hero-535B "
-                    "with native KV precision, PP=1 and SM100 CUDA"
+                    "with native KV precision, TP1/PP1, SM100 FlashInfer TRTLLM "
+                    "attention and no speculative decoding"
                 )
-            self.config = replace(self.config, logical_kv_cache=logical_kv_cache)
+            self.config = replace(
+                self.config,
+                logical_kv_cache=(
+                    eligible if logical_kv_cache is None else logical_kv_cache
+                ),
+            )
         if not self.config.disable_pko:
             raise NotImplementedError(
                 "GrugMoE does not support Partial Key Offset; export a checkpoint "
@@ -1322,9 +1355,19 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
         raise NotImplementedError("GrugMoE does not support LoRA")
     quant_config = vllm_config.quant_config
     if quant_config is not None and (
-        not is_tpu or quant_config.get_name() != _UNQUANTIZED_METHOD
+        (is_tpu and quant_config.get_name() != _UNQUANTIZED_METHOD)
+        or (
+            not is_tpu
+            and (
+                not isinstance(quant_config, Fp8Config)
+                or quant_config.is_checkpoint_fp8_serialized
+            )
+        )
     ):
-        raise NotImplementedError("GrugMoE does not support quantization")
+        raise NotImplementedError(
+            "GrugMoE supports only online FP8 quantization on GPU "
+            "and unquantized execution on TPU"
+        )
     if not is_tpu and parallel_config.tensor_parallel_size != 1:
         raise NotImplementedError(
             "GrugMoE expert-parallel GPU serving requires tensor_parallel_size=1"
