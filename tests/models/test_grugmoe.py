@@ -531,6 +531,7 @@ def test_hero_cache_default_preserves_unqualified_layouts(
 ):
     # Keep Hero's head geometry while making model construction inexpensive.
     GrugMoeConfig(
+        architectures=["GrugMoeForCausalLM"],
         vocab_size=128,
         hidden_size=128,
         intermediate_size=64,
