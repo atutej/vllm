@@ -58,12 +58,10 @@ from vllm.transformers_utils.configs.grugmoe import (
     grug_moe_rope_parameters,
     grug_moe_rope_theta,
 )
-from vllm.utils.flashinfer import can_use_trtllm_attention
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
-from vllm.v1.attention.selector import get_attn_backend
 
 from .interfaces import (
     EagleModelMixin,
@@ -83,7 +81,6 @@ _ROUTER_COMBINE_WEIGHT_EPS = 1e-9
 _UNQUANTIZED_METHOD = "unquantized"
 _HERO_ARTIFACT_SCHEMA_VERSION = 2
 _SUPPORTED_SCONV_SITES = frozenset({"k", "attn", "mlp"})
-_LOGICAL_KV_HEAD_GEOMETRY = (48, 12, 6, 128)
 
 
 def _config_attr(config: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -987,33 +984,6 @@ class GrugMoeAttention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_type=AttentionType.DECODER,
         )
-        if (
-            cfg.logical_kv_cache
-            and is_global
-            and self.cache_kv_heads < cfg.num_kv_heads
-        ):
-            if (
-                (
-                    cfg.num_heads,
-                    cfg.num_kv_heads,
-                    self.cache_kv_heads,
-                    self.head_dim,
-                )
-                != _LOGICAL_KV_HEAD_GEOMETRY
-                or self.attn.attn_backend.get_name() != "FLASHINFER"
-            ):
-                raise NotImplementedError(
-                    "Logical GrugMoE KV cache requires FlashInfer with "
-                    "48 query heads, 12 repeated KV heads and 6 stored KV "
-                    "heads of size 128"
-                )
-            # FlashInfer is optional on other platforms and backend choices.
-            from vllm.v1.attention.backends.flashinfer import FlashInferImpl
-
-            assert isinstance(self.attn.impl, FlashInferImpl)
-            self.attn.impl.decode_query_head_groups = (
-                cfg.num_kv_heads // self.cache_kv_heads
-            )
 
     def apply_xsa(
         self,
@@ -1195,60 +1165,18 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
         additional_config = vllm_config.additional_config
         if isinstance(additional_config, dict):
-            logical_kv_cache = additional_config.get("grug_logical_kv_cache")
-            if "grug_logical_kv_cache" in additional_config and not isinstance(
-                logical_kv_cache, bool
-            ):
-                raise ValueError("grug_logical_kv_cache must be a boolean")
-            eligible = (
-                self.config.is_hero
-                and (
-                    self.config.num_heads,
-                    self.config.num_kv_heads,
-                    self.config.global_kv_heads,
-                    self.config.inferred_head_dim,
-                )
-                == _LOGICAL_KV_HEAD_GEOMETRY
-                and self.config.local_kv_heads == self.config.num_kv_heads
-                and vllm_config.model_config.dtype == torch.bfloat16
-                and vllm_config.cache_config.cache_dtype == "auto"
-                and vllm_config.quant_config is None
-                and get_tensor_model_parallel_world_size() == 1
-                and vllm_config.parallel_config.pipeline_parallel_size == 1
-                and vllm_config.parallel_config.prefill_context_parallel_size == 1
-                and vllm_config.parallel_config.decode_context_parallel_size == 1
-                and vllm_config.speculative_config is None
-                and vllm_config.attention_config.use_trtllm_attention is not False
-                and not vllm_config.attention_config.use_non_causal
-                and current_platform.is_cuda()
-                and current_platform.is_device_capability(100)
+            logical_kv_cache = additional_config.get(
+                "grug_logical_kv_cache", current_platform.is_cuda()
             )
-            if eligible and logical_kv_cache is not False:
-                kv_heads = self.config.logical_kv_heads(is_global=True)
-                # Use the native selector, including per-cache-group overrides.
-                eligible = (
-                    get_attn_backend(
-                        self.config.inferred_head_dim,
-                        vllm_config.model_config.dtype,
-                        vllm_config.cache_config.cache_dtype,
-                    ).get_name()
-                    == "FLASHINFER"
-                    and can_use_trtllm_attention(
-                        self.config.num_heads, kv_heads, is_prefill=True
-                    )
-                    and can_use_trtllm_attention(self.config.num_heads, kv_heads)
-                )
-            if logical_kv_cache and not eligible:
+            if not isinstance(logical_kv_cache, bool):
+                raise ValueError("grug_logical_kv_cache must be a boolean")
+            if logical_kv_cache and not current_platform.is_cuda():
                 raise NotImplementedError(
-                    "Logical GrugMoE KV cache requires unquantized BF16 Hero-535B "
-                    "with native KV precision, TP1/PP1, SM100 FlashInfer TRTLLM "
-                    "attention and no speculative decoding"
+                    "Logical GrugMoE KV caching is supported on CUDA"
                 )
             self.config = replace(
                 self.config,
-                logical_kv_cache=(
-                    eligible if logical_kv_cache is None else logical_kv_cache
-                ),
+                logical_kv_cache=logical_kv_cache,
             )
         if not self.config.disable_pko:
             raise NotImplementedError(

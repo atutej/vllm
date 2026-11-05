@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
-import importlib.util
 import json
 import math
 import os
@@ -54,7 +53,6 @@ from vllm.model_executor.models.grugmoe import (
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
-from vllm.utils import flashinfer as flashinfer_utils
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -513,52 +511,20 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
-    reason="Logical Hero KV caching is qualified on SM100",
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 @pytest.mark.parametrize(
-    "additional_config,backend,trtllm,non_causal,quantization,global_heads,offline",
+    "additional_config,quantization,global_heads",
     [
-        ({}, "FLASHINFER", None, False, None, 6, False),
-        ({"grug_logical_kv_cache": True}, "FLASHINFER", True, False, None, 6, False),
-        ({"grug_logical_kv_cache": False}, "FLASHINFER", None, False, None, 12, False),
-        ({}, "TRITON_ATTN", None, False, None, 12, False),
-        ({}, "FLASHINFER", False, False, None, 12, False),
-        ({}, "FLASHINFER", None, False, "fp8", 12, False),
-        ({}, "FLASHINFER", None, True, None, 12, False),
-        ({}, "FLASHINFER", None, False, None, 12, True),
-        ({"grug_logical_kv_cache": True}, "FLASHINFER", None, False, None, None, True),
+        ({}, None, 6),
+        ({"grug_logical_kv_cache": True}, None, 6),
+        ({"grug_logical_kv_cache": False}, None, 12),
+        ({}, "fp8", 6),
     ],
 )
-def test_hero_cache_default_preserves_unqualified_layouts(
-    tmp_path, monkeypatch, request, additional_config, backend, trtllm, non_causal,
-    quantization, global_heads, offline
+def test_hero_native_gqa_uses_distinct_cache_heads(
+    tmp_path, additional_config, quantization, global_heads
 ):
-    if offline:
-        find_spec = importlib.util.find_spec
-        get = flashinfer_utils.requests.get
-
-        def without_cubins(name, package=None):
-            return None if name == "flashinfer_cubin" else find_spec(name, package)
-
-        def unavailable_artifactory(url, *args, **kwargs):
-            if url == flashinfer_utils.FLASHINFER_CUBINS_REPOSITORY:
-                return SimpleNamespace(status_code=503)
-            return get(url, *args, **kwargs)
-
-        def clear_capabilities():
-            flashinfer_utils.has_flashinfer_cubin.cache_clear()
-            flashinfer_utils.has_nvidia_artifactory.cache_clear()
-            flashinfer_utils.supports_trtllm_attention.cache_clear()
-
-        # Simulate package discovery and HTTP failure at their I/O boundaries.
-        monkeypatch.setattr(importlib.util, "find_spec", without_cubins)
-        monkeypatch.setattr(flashinfer_utils.requests, "get", unavailable_artifactory)
-        clear_capabilities()
-        request.addfinalizer(clear_capabilities)
-
-    # Keep Hero's head geometry while making model construction inexpensive.
+    # Keep the checkpoint's head geometry with inexpensive projections and experts.
     GrugMoeConfig(
         architectures=["GrugMoeForCausalLM"],
         vocab_size=128,
@@ -582,17 +548,8 @@ def test_hero_cache_default_preserves_unqualified_layouts(
         dtype="bfloat16",
         quantization=quantization,
         additional_config=additional_config,
-        attention_config={
-            "backend": backend,
-            "use_trtllm_attention": trtllm,
-            "use_non_causal": non_causal,
-        },
     ).create_engine_config()
     with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
-        if global_heads is None:
-            with pytest.raises(NotImplementedError):
-                GrugMoeModel(vllm_config=vllm_config)
-            return
         model = GrugMoeModel(vllm_config=vllm_config)
         specs = [
             layer.self_attn.attn.get_kv_cache_spec(vllm_config)
