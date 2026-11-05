@@ -29,6 +29,8 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+from vllm.model_executor.model_loader.reload.meta import materialize_layer
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
     _ROUTER_COMBINE_WEIGHT_SUM,
@@ -1307,6 +1309,7 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
         _fill_parameter(quantized.router.weight, -0.1, 0.1)
         _fill_parameter(quantized.router.bias, 0.2, -0.2)
         experts = reference.routed_experts
+        materialize_layer(experts, get_layerwise_info(experts))
         _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
         _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
         _fill_parameter(experts.w2_weight, -0.1, 0.1)
