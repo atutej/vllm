@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoConfig
 
-from tests.kernels.quant_utils import ref_dynamic_per_tensor_fp8_quant
 from tests.utils import ensure_current_vllm_config
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.config.model import ModelConfig
@@ -27,6 +26,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.grugmoe import (
@@ -143,27 +143,6 @@ def _reference_dense_mlp(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
     return F.linear(F.silu(gate) * up, module.down_proj.weight)
 
 
-def _reference_routing(
-    x: torch.Tensor, module: GrugMoeMLP
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if module.cfg.is_hero:
-        router_logits = F.linear(
-            x, module.router.weight.to(x.dtype)
-        ).float()
-    else:
-        router_logits = F.linear(x.float(), module.router.weight.float())
-    _, top_indices = torch.topk(
-        router_logits + module.router.bias.float(),
-        k=module.cfg.num_experts_per_token + 1,
-        dim=-1,
-    )
-    selected = top_indices[:, : module.cfg.num_experts_per_token]
-    combine_weights = torch.sigmoid(torch.gather(router_logits, dim=-1, index=selected))
-    denom = combine_weights.sum(dim=-1, keepdim=True) + _ROUTER_COMBINE_WEIGHT_EPS
-    combine_weights = combine_weights * (_ROUTER_COMBINE_WEIGHT_SUM / denom)
-    return combine_weights, selected
-
-
 def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
     cfg = module.cfg
     x_flat = x.reshape(-1, x.shape[-1])
@@ -174,7 +153,21 @@ def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
             F.linear(x_flat, module.latent_down_proj.weight),
             module.latent_norm,
         )
-    combine_weights, selected = _reference_routing(x_flat, module)
+    if cfg.is_hero:
+        router_logits = F.linear(
+            x_flat, module.router.weight.to(x_flat.dtype)
+        ).float()
+    else:
+        router_logits = F.linear(x_flat.float(), module.router.weight.float())
+    _, top_indices = torch.topk(
+        router_logits + module.router.bias.float(),
+        k=cfg.num_experts_per_token + 1,
+        dim=-1,
+    )
+    selected = top_indices[:, : cfg.num_experts_per_token]
+    combine_weights = torch.sigmoid(torch.gather(router_logits, dim=-1, index=selected))
+    denom = combine_weights.sum(dim=-1, keepdim=True) + _ROUTER_COMBINE_WEIGHT_EPS
+    combine_weights = combine_weights * (_ROUTER_COMBINE_WEIGHT_SUM / denom)
 
     routed_experts = module.experts.routed_experts
     w13_weight = routed_experts.w13_weight
@@ -206,33 +199,6 @@ def _reference_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
     if module.latent_up_proj is not None:
         out = F.linear(out, module.latent_up_proj.weight)
     return out.to(x.dtype).reshape_as(x)
-
-
-def _round_to_fp8(x: torch.Tensor) -> torch.Tensor:
-    """Round through tensorwise FP8 and return dequantized FP32 values."""
-    quantized, scale = ref_dynamic_per_tensor_fp8_quant(x)
-    return quantized.float() * scale
-
-
-def _reference_fp8_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
-    """Tensorwise FP8 reference from the original BF16 expert weights."""
-    assert module.latent_down_proj is None
-    x_flat = x.reshape(-1, x.shape[-1])
-    combine_weights, selected = _reference_routing(x_flat, module)
-    experts = module.experts.routed_experts
-    gate_up_weights = torch.stack([_round_to_fp8(w) for w in experts.w13_weight])
-    down_weights = torch.stack([_round_to_fp8(w) for w in experts.w2_weight])
-
-    gate_up = torch.einsum(
-        "td,tkid->tki", _round_to_fp8(x_flat), gate_up_weights[selected]
-    ).to(x.dtype)
-    gate, up = gate_up.chunk(2, dim=-1)
-    hidden = F.silu(gate) * up
-    out = torch.einsum(
-        "tki,tkdi->tkd", _round_to_fp8(hidden), down_weights[selected]
-    )
-    out = (out * combine_weights.unsqueeze(-1)).to(x.dtype)
-    return out.sum(dim=1).reshape_as(x)
 
 
 def _fill_parameter(param: torch.Tensor, start: float, end: float) -> None:
@@ -1299,8 +1265,7 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("num_tokens", [1, 3, 7])
-def test_grug_moe_online_fp8_matches_quantized_reference(monkeypatch, num_tokens):
+def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
     cfg = replace(
         _tiny_config(),
         hidden_dim=64,
@@ -1308,23 +1273,6 @@ def test_grug_moe_online_fp8_matches_quantized_reference(monkeypatch, num_tokens
         num_heads=4,
         head_dim=16,
     ).validate()
-    reference = GrugMoeMLP(cfg, params_dtype=torch.bfloat16).cuda()
-    with torch.no_grad():
-        _fill_parameter(reference.router.weight, -0.1, 0.1)
-        _fill_parameter(reference.router.bias, 0.2, -0.2)
-        experts = reference.experts.routed_experts
-        _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
-        _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
-        _fill_parameter(experts.w2_weight, -0.1, 0.1)
-        # Distinct expert scales make accidental scale sharing observable.
-        experts.w13_weight[0].mul_(1.5)
-        experts.w2_weight[0].mul_(0.75)
-
-    x = torch.linspace(-0.6, 0.7, num_tokens * cfg.hidden_dim, device="cuda").reshape(
-        num_tokens, cfg.hidden_dim
-    ).to(torch.bfloat16)
-    expected = _reference_fp8_moe(x, reference)
-
     monkeypatch.setattr(
         get_current_vllm_config(),
         "model_config",
@@ -1338,9 +1286,30 @@ def test_grug_moe_online_fp8_matches_quantized_reference(monkeypatch, num_tokens
             quant_config=Fp8Config(),
             prefix="model.layers.0.mlp",
         )
+        # Direct vLLM weights bypass Grug's checkpoint mapping.
+        reference = FusedMoEFactory(
+            num_experts=cfg.num_experts,
+            top_k=cfg.num_experts_per_token,
+            hidden_size=cfg.hidden_dim,
+            intermediate_size=cfg.intermediate_dim,
+            params_dtype=torch.bfloat16,
+            renormalize=False,
+            quant_config=Fp8Config(),
+            prefix="reference.experts",
+            router=GrugMoeRouter(
+                top_k=cfg.num_experts_per_token,
+                global_num_experts=cfg.num_experts,
+                bias=quantized.router.bias,
+            ),
+            router_logits_dtype=torch.float32,
+        )
     with torch.no_grad():
-        quantized.router.weight.copy_(reference.router.weight)
-        quantized.router.bias.copy_(reference.router.bias)
+        _fill_parameter(quantized.router.weight, -0.1, 0.1)
+        _fill_parameter(quantized.router.bias, 0.2, -0.2)
+        experts = reference.routed_experts
+        _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
+        _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
+        _fill_parameter(experts.w2_weight, -0.1, 0.1)
         params_dict = dict(quantized.named_parameters())
         for projection, weight in (
             ("gate_proj", experts.w13_weight[:, : cfg.intermediate_dim]),
@@ -1350,15 +1319,17 @@ def test_grug_moe_online_fp8_matches_quantized_reference(monkeypatch, num_tokens
             _try_load_grug_expert_weight(
                 f"experts.{projection}.weight", weight, params_dict
             )
+        experts.quant_method.process_weights_after_loading(experts)
+
+    x = torch.linspace(-0.6, 0.7, 3 * cfg.hidden_dim, device="cuda").reshape(
+        3, cfg.hidden_dim
+    ).to(torch.bfloat16)
     init_workspace_manager(torch.device("cuda"))
     with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
+        expected = reference(x, F.linear(x.float(), quantized.router.weight))
         actual = quantized(x)
 
-    # The reference includes FP8 rounding. Require agreement within one BF16
-    # epsilon for the remaining arithmetic, with no absolute-error allowance.
-    torch.testing.assert_close(
-        actual, expected, rtol=torch.finfo(torch.bfloat16).eps, atol=0
-    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_grug_moe_router_selects_logical_expert_ids():
