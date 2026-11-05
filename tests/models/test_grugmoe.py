@@ -227,8 +227,7 @@ def _reference_fp8_moe(x: torch.Tensor, module: GrugMoeMLP) -> torch.Tensor:
         "td,tkid->tki", _round_to_fp8(x_flat), gate_up_weights[selected]
     ).to(x.dtype)
     gate, up = gate_up.chunk(2, dim=-1)
-    # The fused activation rounds once after SiLU and multiplication.
-    hidden = (F.silu(gate.float()) * up.float()).to(x.dtype)
+    hidden = F.silu(gate) * up
     out = torch.einsum(
         "tki,tkdi->tkd", _round_to_fp8(hidden), down_weights[selected]
     )
