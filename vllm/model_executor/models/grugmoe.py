@@ -1224,6 +1224,7 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 and current_platform.is_device_capability(100)
             )
             if eligible and logical_kv_cache is not False:
+                kv_heads = self.config.logical_kv_heads(is_global=True)
                 # Use the native selector, including per-cache-group overrides.
                 eligible = (
                     get_attn_backend(
@@ -1233,11 +1234,9 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                     ).get_name()
                     == "FLASHINFER"
                     and can_use_trtllm_attention(
-                        self.config.num_heads, self.config.global_kv_heads, is_prefill=True
+                        self.config.num_heads, kv_heads, is_prefill=True
                     )
-                    and can_use_trtllm_attention(
-                        self.config.num_heads, self.config.global_kv_heads
-                    )
+                    and can_use_trtllm_attention(self.config.num_heads, kv_heads)
                 )
             if logical_kv_cache and not eligible:
                 raise NotImplementedError(
