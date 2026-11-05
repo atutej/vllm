@@ -26,8 +26,11 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+from vllm.model_executor.model_loader.reload.meta import materialize_layer
 from vllm.model_executor.models.grugmoe import (
     _ROUTER_COMBINE_WEIGHT_EPS,
     _ROUTER_COMBINE_WEIGHT_SUM,
@@ -1264,7 +1267,7 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_grug_moe_online_fp8_matches_bf16_reference(monkeypatch):
+def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
     cfg = replace(
         _tiny_config(),
         hidden_dim=64,
@@ -1272,34 +1275,44 @@ def test_grug_moe_online_fp8_matches_bf16_reference(monkeypatch):
         num_heads=4,
         head_dim=16,
     ).validate()
-    reference = GrugMoeMLP(cfg, params_dtype=torch.bfloat16).cuda()
-    with torch.no_grad():
-        _fill_parameter(reference.router.weight, -0.1, 0.1)
-        _fill_parameter(reference.router.bias, 0.2, -0.2)
-        experts = reference.experts.routed_experts
-        _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
-        _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
-        _fill_parameter(experts.w2_weight, -0.1, 0.1)
-
-    x = torch.linspace(-0.6, 0.7, 3 * cfg.hidden_dim, device="cuda").reshape(
-        3, cfg.hidden_dim
-    ).to(torch.bfloat16)
-    expected = _reference_moe(x, reference)
-
     monkeypatch.setattr(
         get_current_vllm_config(),
         "model_config",
         SimpleNamespace(dtype=torch.bfloat16),
     )
-    quantized = GrugMoeMLP(
-        cfg,
-        params_dtype=torch.bfloat16,
-        quant_config=Fp8Config(),
-        prefix="model.layers.0.mlp",
-    )
+    # Online weight loading captures this device before it quantizes the experts.
+    with torch.device("cuda"):
+        quantized = GrugMoeMLP(
+            cfg,
+            params_dtype=torch.bfloat16,
+            quant_config=Fp8Config(),
+            prefix="model.layers.0.mlp",
+        )
+        # Direct vLLM weights bypass Grug's checkpoint mapping.
+        reference = FusedMoEFactory(
+            num_experts=cfg.num_experts,
+            top_k=cfg.num_experts_per_token,
+            hidden_size=cfg.hidden_dim,
+            intermediate_size=cfg.intermediate_dim,
+            params_dtype=torch.bfloat16,
+            renormalize=False,
+            quant_config=Fp8Config(),
+            prefix="reference.experts",
+            router=GrugMoeRouter(
+                top_k=cfg.num_experts_per_token,
+                global_num_experts=cfg.num_experts,
+                bias=quantized.router.bias,
+            ),
+            router_logits_dtype=torch.float32,
+        )
     with torch.no_grad():
-        quantized.router.weight.copy_(reference.router.weight.cpu())
-        quantized.router.bias.copy_(reference.router.bias.cpu())
+        _fill_parameter(quantized.router.weight, -0.1, 0.1)
+        _fill_parameter(quantized.router.bias, 0.2, -0.2)
+        experts = reference.routed_experts
+        materialize_layer(experts, get_layerwise_info(experts))
+        _fill_parameter(experts.w13_weight[:, : cfg.intermediate_dim], -0.15, 0.15)
+        _fill_parameter(experts.w13_weight[:, cfg.intermediate_dim :], 0.12, -0.12)
+        _fill_parameter(experts.w2_weight, -0.1, 0.1)
         params_dict = dict(quantized.named_parameters())
         for projection, weight in (
             ("gate_proj", experts.w13_weight[:, : cfg.intermediate_dim]),
@@ -1309,13 +1322,17 @@ def test_grug_moe_online_fp8_matches_bf16_reference(monkeypatch):
             _try_load_grug_expert_weight(
                 f"experts.{projection}.weight", weight, params_dict
             )
-    quantized.cuda()
+        experts.quant_method.process_weights_after_loading(experts)
 
+    x = torch.linspace(-0.6, 0.7, 3 * cfg.hidden_dim, device="cuda").reshape(
+        3, cfg.hidden_dim
+    ).to(torch.bfloat16)
     init_workspace_manager(torch.device("cuda"))
     with set_forward_context(None, get_current_vllm_config(), num_tokens=x.shape[0]):
+        expected = reference(x, F.linear(x.float(), quantized.router.weight))
         actual = quantized(x)
 
-    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_grug_moe_router_selects_logical_expert_ids():
