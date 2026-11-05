@@ -58,6 +58,7 @@ from vllm.transformers_utils.configs.grugmoe import (
     grug_moe_rope_parameters,
     grug_moe_rope_theta,
 )
+from vllm.utils.flashinfer import can_use_trtllm_attention
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -1231,6 +1232,12 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                         vllm_config.cache_config.cache_dtype,
                     ).get_name()
                     == "FLASHINFER"
+                    and can_use_trtllm_attention(
+                        self.config.num_heads, self.config.global_kv_heads, is_prefill=True
+                    )
+                    and can_use_trtllm_attention(
+                        self.config.num_heads, self.config.global_kv_heads
+                    )
                 )
             if logical_kv_cache and not eligible:
                 raise NotImplementedError(
