@@ -516,18 +516,19 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
     reason="Logical Hero KV caching is qualified on SM100",
 )
 @pytest.mark.parametrize(
-    "additional_config,backend,trtllm,quantization,global_heads",
+    "additional_config,backend,trtllm,non_causal,quantization,global_heads",
     [
-        ({}, "FLASHINFER", None, None, 6),
-        ({"grug_logical_kv_cache": True}, "FLASHINFER", True, None, 6),
-        ({"grug_logical_kv_cache": False}, "FLASHINFER", None, None, 12),
-        ({}, "TRITON_ATTN", None, None, 12),
-        ({}, "FLASHINFER", False, None, 12),
-        ({}, "FLASHINFER", None, "fp8", 12),
+        ({}, "FLASHINFER", None, False, None, 6),
+        ({"grug_logical_kv_cache": True}, "FLASHINFER", True, False, None, 6),
+        ({"grug_logical_kv_cache": False}, "FLASHINFER", None, False, None, 12),
+        ({}, "TRITON_ATTN", None, False, None, 12),
+        ({}, "FLASHINFER", False, False, None, 12),
+        ({}, "FLASHINFER", None, False, "fp8", 12),
+        ({}, "FLASHINFER", None, True, None, 12),
     ],
 )
 def test_hero_cache_default_preserves_unqualified_layouts(
-    tmp_path, additional_config, backend, trtllm, quantization, global_heads
+    tmp_path, additional_config, backend, trtllm, non_causal, quantization, global_heads
 ):
     # Keep Hero's head geometry while making model construction inexpensive.
     GrugMoeConfig(
@@ -553,7 +554,11 @@ def test_hero_cache_default_preserves_unqualified_layouts(
         dtype="bfloat16",
         quantization=quantization,
         additional_config=additional_config,
-        attention_config={"backend": backend, "use_trtllm_attention": trtllm},
+        attention_config={
+            "backend": backend,
+            "use_trtllm_attention": trtllm,
+            "use_non_causal": non_causal,
+        },
     ).create_engine_config()
     with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
         model = GrugMoeModel(vllm_config=vllm_config)

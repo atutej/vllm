@@ -1214,8 +1214,11 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 and vllm_config.quant_config is None
                 and get_tensor_model_parallel_world_size() == 1
                 and vllm_config.parallel_config.pipeline_parallel_size == 1
+                and vllm_config.parallel_config.prefill_context_parallel_size == 1
+                and vllm_config.parallel_config.decode_context_parallel_size == 1
                 and vllm_config.speculative_config is None
                 and vllm_config.attention_config.use_trtllm_attention is not False
+                and not vllm_config.attention_config.use_non_causal
                 and current_platform.is_cuda()
                 and current_platform.is_device_capability(100)
             )
