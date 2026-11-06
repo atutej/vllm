@@ -5,7 +5,7 @@
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from itertools import islice
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -718,7 +718,7 @@ class GrugMoeMLP(nn.Module):
         # TPU functional_call replaces registered parameters with sharded
         # tensors. Keep the non-Module custom router bound to that current
         # bias rather than the CPU Parameter captured during construction.
-        self.experts.router.bias = self.router.bias
+        cast(GrugMoeRouter, self.experts.router).bias = self.router.bias
         routed_input = self._routed_input(x_flat)
         if not x_flat.is_cuda and not current_platform.is_tpu():
             out = self._forward_torch_reference(x_flat, routed_input)
@@ -1356,10 +1356,10 @@ def _try_load_grug_expert_weight(
     split_expert_id = None
     parts = name.rsplit(".", 3)
     if len(parts) == 4:
-        prefix, expert_id, projection, suffix = parts
+        prefix, expert_id_text, projection, suffix = parts
         if (
             prefix.rsplit(".", 1)[-1] == "experts"
-            and expert_id.isdecimal()
+            and expert_id_text.isdecimal()
             and projection in {"gate_proj", "down_proj", "up_proj"}
             and suffix == "weight"
         ):
@@ -1368,7 +1368,7 @@ def _try_load_grug_expert_weight(
                     f"Split Grug expert weight must be 2D, got "
                     f"{loaded_weight.ndim}D for {name!r}"
                 )
-            split_expert_id = int(expert_id)
+            split_expert_id = int(expert_id_text)
             name = f"{prefix}.{projection}.weight"
 
     for weight_name, param_name, shard_id in _EXPERT_WEIGHT_MAPPING:
@@ -1386,6 +1386,7 @@ def _try_load_grug_expert_weight(
             raise ValueError(
                 f"Grug expert parameter {mapped_name!r} has no FusedMoE weight_loader"
             )
+        expert_weights: Iterable[tuple[int, torch.Tensor]]
         if split_expert_id is not None:
             expert_weights = ((split_expert_id, loaded_weight),)
         else:

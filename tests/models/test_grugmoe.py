@@ -6,6 +6,7 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Iterable
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1181,7 +1182,10 @@ def test_hero_grug_moe_sconv_preserves_request_history_and_isolation():
     )
     request_b = torch.tensor([[10.0, 4.0], [20.0, 8.0]], device="cuda")
     prefill = torch.vstack((request_a, request_b))
-    for profiling_metadata in (None, {}):
+    profiling_cases: tuple[dict[str, ShortConvAttentionMetadata] | None, ...] = (
+        None, {}
+    )
+    for profiling_metadata in profiling_cases:
         # V1 omits all metadata; V2's profiling pass omits Mamba groups from
         # its dictionary. Neither pass may consume or mutate request history.
         with set_forward_context(
@@ -1443,6 +1447,7 @@ def test_grug_moe_expert_weights_load_into_fused_moe_layout(split: bool):
         ("up_proj", up_weight),
         ("down_proj", down_weight),
     ):
+        shards: Iterable[tuple[str, torch.Tensor]]
         if split:
             shards = (
                 (f"experts.{expert_id}.{projection}.weight", weight[expert_id])
