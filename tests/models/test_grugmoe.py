@@ -15,8 +15,13 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoConfig
 
-from tests.utils import ensure_current_vllm_config
-from vllm.config import CUDAGraphMode, get_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    KernelConfig,
+    VllmConfig,
+    get_current_vllm_config,
+    set_current_vllm_config,
+)
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -59,7 +64,10 @@ def single_rank_model_parallel():
     fd, temp_file = tempfile.mkstemp()
     os.close(fd)
     try:
-        with ensure_current_vllm_config():
+        # These references inspect raw [gate; up] weights. FlashInfer CUTLASS
+        # repacks them to [up; gate]; production Hero uses the Triton backend.
+        config = VllmConfig(kernel_config=KernelConfig(moe_backend="triton"))
+        with set_current_vllm_config(config):
             init_distributed_environment(
                 world_size=1,
                 rank=0,

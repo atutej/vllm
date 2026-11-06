@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.multiprocessing import spawn
 
 from tests.utils import multi_gpu_marks
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.parallel_state import (
@@ -39,9 +39,12 @@ def _load_projection(module, weight):
 
 def _tp_projection_worker(rank, tp_size, init_file):
     torch.cuda.set_device(rank)
-    config = VllmConfig(parallel_config=ParallelConfig(
-        tensor_parallel_size=tp_size, enable_expert_parallel=True,
-    ))
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=tp_size, enable_expert_parallel=True,
+        ),
+        kernel_config=KernelConfig(moe_backend="triton"),
+    )
     with set_current_vllm_config(config):
         init_distributed_environment(
             world_size=tp_size, rank=rank, distributed_init_method=f"file://{init_file}",
@@ -192,11 +195,14 @@ def _tp_moe_worker(rank, tp_size, dp_size, init_file):
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(tp_size * dp_size)
     dp_rank = rank // tp_size
-    config = VllmConfig(parallel_config=ParallelConfig(
-        tensor_parallel_size=tp_size, data_parallel_size=dp_size,
-        data_parallel_rank=dp_rank, enable_expert_parallel=True,
-        distributed_executor_backend="external_launcher",
-    ))
+    config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=tp_size, data_parallel_size=dp_size,
+            data_parallel_rank=dp_rank, enable_expert_parallel=True,
+            distributed_executor_backend="external_launcher",
+        ),
+        kernel_config=KernelConfig(moe_backend="triton"),
+    )
     with set_current_vllm_config(config):
         init_distributed_environment(
             world_size=tp_size * dp_size, rank=rank,
