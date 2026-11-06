@@ -64,6 +64,10 @@ def single_rank_model_parallel():
     os.close(fd)
     try:
         with ensure_current_vllm_config():
+            # Tiny CPU math fixtures need plain expert weights. SM100's auto
+            # backend packs/pads them for its GPU kernel. Use the serving
+            # recipe's Triton backend for these small-shape checks.
+            get_current_vllm_config().kernel_config.moe_backend = "triton"
             init_distributed_environment(
                 world_size=1,
                 rank=0,
@@ -513,16 +517,17 @@ def test_grug_moe_hf_config_loads_hero_fields(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 @pytest.mark.parametrize(
-    "additional_config,quantization,global_heads",
+    "additional_config,quantization,cache_dtype,global_heads",
     [
-        ({}, None, 6),
-        ({"grug_logical_kv_cache": True}, None, 6),
-        ({"grug_logical_kv_cache": False}, None, 12),
-        ({}, "fp8", 6),
+        ({}, None, "auto", 6),
+        ({"grug_logical_kv_cache": True}, None, "auto", 6),
+        ({"grug_logical_kv_cache": False}, None, "auto", 12),
+        ({}, "fp8", "auto", 6),
+        ({}, None, "fp8", 12),
     ],
 )
 def test_hero_native_gqa_uses_distinct_cache_heads(
-    tmp_path, additional_config, quantization, global_heads
+    tmp_path, additional_config, quantization, cache_dtype, global_heads
 ):
     # Keep the checkpoint's head geometry with inexpensive projections and experts.
     GrugMoeConfig(
@@ -547,6 +552,7 @@ def test_hero_native_gqa_uses_distinct_cache_heads(
         skip_tokenizer_init=True,
         dtype="bfloat16",
         quantization=quantization,
+        kv_cache_dtype=cache_dtype,
         additional_config=additional_config,
     ).create_engine_config()
     with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
@@ -557,7 +563,8 @@ def test_hero_native_gqa_uses_distinct_cache_heads(
         ]
     assert [spec.num_kv_heads for spec in specs] == [12, global_heads]
     assert specs[1].page_size_bytes == (
-        2 * vllm_config.cache_config.block_size * global_heads * 128 * 2
+        2 * vllm_config.cache_config.block_size * global_heads * 128
+        * (1 if cache_dtype == "fp8" else 2)
     )
 
 

@@ -1165,14 +1165,22 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         self.config = GrugMoeRuntimeConfig.from_hf_config(hf_config)
         additional_config = vllm_config.additional_config
         if isinstance(additional_config, dict):
+            unquantized_kv = vllm_config.cache_config.cache_dtype in (
+                "auto", "float16", "bfloat16"
+            )
             logical_kv_cache = additional_config.get(
-                "grug_logical_kv_cache", current_platform.is_cuda()
+                "grug_logical_kv_cache",
+                current_platform.is_cuda() and unquantized_kv,
             )
             if not isinstance(logical_kv_cache, bool):
                 raise ValueError("grug_logical_kv_cache must be a boolean")
             if logical_kv_cache and not current_platform.is_cuda():
                 raise NotImplementedError(
                     "Logical GrugMoE KV caching is supported on CUDA"
+                )
+            if logical_kv_cache and not unquantized_kv:
+                raise NotImplementedError(
+                    "Logical GrugMoE KV caching requires unquantized KV storage"
                 )
             self.config = replace(
                 self.config,
