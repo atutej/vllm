@@ -1509,8 +1509,12 @@ class GrugMoeForCausalLM(
             hf_config = vllm_config.model_config.hf_config
         cfg = GrugMoeRuntimeConfig.from_hf_config(hf_config)
         return MambaStateShapeCalculator.short_conv_state_shape(
-            # Attention/MLP output convolutions run after the TP reduction.
-            tp_world_size=1,
+            # GPU output convolutions run after the TP reduction. Preserve
+            # the existing TPU cache sizing.
+            tp_world_size=(
+                vllm_config.parallel_config.tensor_parallel_size
+                if current_platform.is_tpu() else 1
+            ),
             intermediate_size=cfg.hidden_dim,
             conv_kernel=cfg.sconv_kernel,
         )
