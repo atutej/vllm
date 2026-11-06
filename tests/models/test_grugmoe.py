@@ -42,6 +42,7 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeRouter,
     GrugMoeRuntimeConfig,
     GrugMoeShortConv,
+    _expand_grug_kv_weight,
     _raise_for_unsupported_modes,
     _try_load_grug_expert_weight,
     get_grug_moe_runtime_info,
@@ -689,14 +690,6 @@ def _patch_grug_parallel_runtime(monkeypatch, fake_config, *, is_tpu):
         "vllm.model_executor.models.grugmoe.current_platform.is_tpu",
         lambda: is_tpu,
     )
-
-
-def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
-    fake_config = _minimal_vllm_config_for_mode_check(tensor_parallel_size=8)
-    _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=False)
-
-    with pytest.raises(NotImplementedError, match="tensor_parallel_size=1"):
-        _raise_for_unsupported_modes(fake_config)
 
 
 @pytest.mark.parametrize(
@@ -1586,6 +1579,45 @@ def test_grug_moe_tiny_decoder_layer_matches_reference_math():
     expected = hidden_states + expected_mlp
 
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("logical_kv_heads", [6, 12])
+def test_grug_kv_shards_preserve_causal_convolution(tp_size, logical_kv_heads):
+    """Moving logical-head expansion before projection/conv preserves every head."""
+    generator = torch.Generator().manual_seed(901)
+    num_kv_heads, head_dim, hidden_dim, kernel = 12, 8, 16, 4
+    x = torch.randn(7, hidden_dim, generator=generator)
+    projection = torch.randn(
+        num_kv_heads * head_dim, hidden_dim, generator=generator
+    )
+    conv = torch.randn(kernel, num_kv_heads * head_dim, generator=generator)
+    full_projection = F.linear(x, projection)
+    full_conv = F.conv1d(
+        full_projection.T.unsqueeze(0), conv.T.flip(-1).unsqueeze(1),
+        padding=kernel - 1, groups=num_kv_heads * head_dim,
+    )[0, :, :x.shape[0]].T
+    expected = full_conv.reshape(-1, num_kv_heads, head_dim)
+    expected = expected[:, :logical_kv_heads].repeat_interleave(
+        num_kv_heads // logical_kv_heads, dim=1
+    ).flatten(1)
+
+    expanded_projection = _expand_grug_kv_weight(
+        projection, num_kv_heads, logical_kv_heads, head_dim, 0
+    )
+    expanded_conv = _expand_grug_kv_weight(
+        conv, num_kv_heads, logical_kv_heads, head_dim, 1
+    )
+    outputs = []
+    for shard_projection, shard_conv in zip(
+        expanded_projection.chunk(tp_size), expanded_conv.chunk(tp_size, dim=1)
+    ):
+        projected = F.linear(x, shard_projection)
+        outputs.append(F.conv1d(
+            projected.T.unsqueeze(0), shard_conv.T.flip(-1).unsqueeze(1),
+            padding=kernel - 1, groups=shard_projection.shape[0],
+        )[0, :, :x.shape[0]].T)
+    torch.testing.assert_close(torch.cat(outputs, dim=-1), expected)
 
 
 def test_grug_xsa_correction_and_gate_match_reference_math():
