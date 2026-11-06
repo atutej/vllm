@@ -491,16 +491,17 @@ def test_grug_moe_norm_defaults_follow_training_rounding(
         dtype=torch.bfloat16,
         device="cuda",
     )
+    eps = 1e-5
     with (
         set_current_vllm_config(config),
         config.kernel_config.ir_op_priority.set_priority(),
     ):
-        norm = RMSNorm(4, eps=1e-5, dtype=torch.bfloat16).cuda()
+        norm = RMSNorm(4, eps=eps, dtype=torch.bfloat16).cuda()
         with torch.no_grad():
             norm.weight.copy_(torch.tensor([0.75, 1.25, 0.5, 1.5]))
             actual = norm(inputs)
         normalized = inputs.double() * torch.rsqrt(
-            inputs.double().square().mean(dim=-1, keepdim=True) + 1e-5
+            inputs.double().square().mean(dim=-1, keepdim=True) + eps
         )
         if not single_round:
             normalized = normalized.bfloat16().double()
