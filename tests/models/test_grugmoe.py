@@ -67,7 +67,8 @@ def single_rank_model_parallel():
             # Tiny CPU math fixtures need plain expert weights. SM100's auto
             # backend packs/pads them for its GPU kernel. Use the serving
             # recipe's Triton backend for these small-shape checks.
-            get_current_vllm_config().kernel_config.moe_backend = "triton"
+            if torch.cuda.is_available():
+                get_current_vllm_config().kernel_config.moe_backend = "triton"
             init_distributed_environment(
                 world_size=1,
                 rank=0,
