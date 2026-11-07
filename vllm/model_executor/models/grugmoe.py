@@ -161,8 +161,8 @@ def get_grug_moe_runtime_info(
     attention_backend = first_layer.self_attn.attn.attn_backend.get_name()
     pp_group = get_pp_group()
     return {
-        "tp_size": int(moe_parallel_config.tp_size),
-        "tp_rank": int(moe_parallel_config.tp_rank),
+        "tp_size": get_tensor_model_parallel_world_size(),
+        "tp_rank": get_tensor_model_parallel_rank(),
         "pp_size": int(pp_group.world_size),
         "pp_rank": int(pp_group.rank_in_group),
         "start_layer": int(grug_model.start_layer),
@@ -1447,6 +1447,17 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
             raise NotImplementedError(
                 "Hero TP2/TP6 currently requires BF16 weights and execution; "
                 "use dtype=bfloat16 without quantization, or TP1 for online FP8"
+            )
+        compilation = vllm_config.compilation_config
+        if compilation.cudagraph_mode.has_piecewise_cudagraphs() and {
+            "vllm::moe_forward", "vllm::moe_forward_shared",
+        }.intersection(compilation.splitting_ops or []):
+            # A split MoE can return a fresh buffer that a replayed graph
+            # still reads at its captured address.
+            raise NotImplementedError(
+                "Hero TP2/TP6 MoE operations must remain inside CUDA graphs. "
+                "Remove vllm::moe_forward and vllm::moe_forward_shared from "
+                "splitting_ops; keep vllm::grug_moe_short_conv split."
             )
     if (
         not is_tpu
