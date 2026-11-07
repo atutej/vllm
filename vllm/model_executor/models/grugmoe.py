@@ -629,15 +629,16 @@ class GrugMoeMLP(nn.Module):
             global_num_experts=cfg.num_experts,
             bias=self.router.bias,
         )
+        # EP ranks consume the full latent vector. Replicated projections avoid
+        # a gather before the experts and a second output reduction afterward.
         self.latent_down_proj = (
-            ColumnParallelLinear(
+            ReplicatedLinear(
                 cfg.hidden_dim,
                 cfg.expert_dim,
                 bias=False,
                 params_dtype=params_dtype,
                 quant_config=quant_config,
-                gather_output=True,
-                disable_tp=current_platform.is_tpu(),
+                disable_tp=True,
                 prefix=f"{prefix}.latent_down_proj",
             )
             if cfg.latent_dim is not None
@@ -649,14 +650,13 @@ class GrugMoeMLP(nn.Module):
             else None
         )
         self.latent_up_proj = (
-            RowParallelLinear(
+            ReplicatedLinear(
                 cfg.expert_dim,
                 cfg.hidden_dim,
                 bias=False,
                 params_dtype=params_dtype,
                 quant_config=quant_config,
-                input_is_parallel=False,
-                disable_tp=current_platform.is_tpu(),
+                disable_tp=True,
                 prefix=f"{prefix}.latent_up_proj",
             )
             if cfg.latent_dim is not None

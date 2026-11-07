@@ -110,8 +110,8 @@ def _check_tp_projections(rank, tp_size):
         moe._expand_routed_output(actual_latent),
         F.linear(expected_latent, latent_up), atol=1e-6, rtol=1e-5,
     )
-    assert moe.latent_down_proj.weight.numel() == latent_down.numel() // tp_size
-    assert moe.latent_up_proj.weight.numel() == latent_up.numel() // tp_size
+    assert moe.latent_down_proj.weight.numel() == latent_down.numel()
+    assert moe.latent_up_proj.weight.numel() == latent_up.numel()
 
     for is_global in (False, True):
         attention = GrugMoeAttention(
@@ -280,7 +280,7 @@ def _check_tp_moe(config, dp_rank, dp_size):
     ):
         actual = module(x)
     # The independent oracle accumulates in FP32; the fused expert kernels and
-    # latent TP reductions round BF16 intermediate values. This absolute bound
+    # latent projections round BF16 intermediate values. This absolute bound
     # applies to this fixed fixture, including output values near zero.
     max_error = (actual.float() - expected).abs().max().item()
     assert max_error < 5e-4, f"BF16 MoE max absolute error: {max_error}"
