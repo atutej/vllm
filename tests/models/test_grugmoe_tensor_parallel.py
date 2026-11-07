@@ -218,26 +218,30 @@ def _tp_moe_worker(rank, tp_size, dp_size, init_file):
 
 def _check_tp_moe(config, dp_rank, dp_size):
     torch.manual_seed(823)
+    # Preserve the original TP2/TP4 fixture; TP6 needs twelve experts.
+    width, num_experts = (
+        (192, 12) if config.parallel_config.tensor_parallel_size == 6 else (128, 8)
+    )
     cfg = GrugMoeRuntimeConfig(
-        vocab_size=192, artifact_schema_version=2, hidden_dim=192,
-        intermediate_dim=192, shared_expert_intermediate_dim=192,
-        num_shared_experts=2, num_experts=12, num_experts_per_token=2,
-        latent_dim=192, num_layers=1, num_heads=4, num_kv_heads=4,
+        vocab_size=width, artifact_schema_version=2, hidden_dim=width,
+        intermediate_dim=width, shared_expert_intermediate_dim=width,
+        num_shared_experts=2, num_experts=num_experts, num_experts_per_token=2,
+        latent_dim=width, num_layers=1, num_heads=4, num_kv_heads=4,
         head_dim=32, max_seq_len=32, sliding_window=16, initializer_std=0.02,
         disable_pko=True,
     ).validate()
     module = GrugMoeMLP(cfg, torch.bfloat16, prefix="moe")
-    latent_down = (torch.randn(192, 192) * 0.03).bfloat16()
-    latent_up = (torch.randn(192, 192) * 0.03).bfloat16()
-    gate = (torch.randn(12, 192, 192) * 0.03).bfloat16()
-    up = (torch.randn(12, 192, 192) * 0.03).bfloat16()
-    down = (torch.randn(12, 192, 192) * 0.03).bfloat16()
+    latent_down = (torch.randn(width, width) * 0.03).bfloat16()
+    latent_up = (torch.randn(width, width) * 0.03).bfloat16()
+    gate = (torch.randn(num_experts, width, width) * 0.03).bfloat16()
+    up = (torch.randn(num_experts, width, width) * 0.03).bfloat16()
+    down = (torch.randn(num_experts, width, width) * 0.03).bfloat16()
     _load_projection(module.latent_down_proj, latent_down)
     _load_projection(module.latent_up_proj, latent_up)
     module.latent_norm.weight.fill_(1)
     module.router.weight.zero_()
-    module.router.weight[:, :12].copy_(3 * torch.eye(12))
-    module.router.bias.copy_(torch.arange(12) * 0.01)
+    module.router.weight[:, :num_experts].copy_(3 * torch.eye(num_experts))
+    module.router.bias.copy_(torch.arange(num_experts) * 0.01)
     params = dict(module.named_parameters())
     for name, bank in (("gate_proj", gate), ("up_proj", up), ("down_proj", down)):
         for expert_id, weight in enumerate(bank):
@@ -250,8 +254,10 @@ def _check_tp_moe(config, dp_rank, dp_size):
     # TP peers receive identical tokens; DP peers receive different token IDs
     # and lengths so EP gather/scatter cannot pass by returning another DP's batch.
     tokens = 7 + 2 * dp_rank
-    x = (torch.randn(tokens, 192) * 0.3).bfloat16()
-    x[:, :12] = F.one_hot((torch.arange(tokens) + 3 * dp_rank) % 12, 12).bfloat16()
+    x = (torch.randn(tokens, width) * 0.3).bfloat16()
+    x[:, :num_experts] = F.one_hot(
+        (torch.arange(tokens) + 3 * dp_rank) % num_experts, num_experts
+    ).bfloat16()
     latent = F.linear(x, latent_down).float()
     latent *= torch.rsqrt(latent.square().mean(-1, keepdim=True) + cfg.layer_norm_eps)
     latent = latent.bfloat16()
@@ -259,7 +265,7 @@ def _check_tp_moe(config, dp_rank, dp_size):
     selected = (logits + module.router.bias).topk(3, dim=-1).indices[:, :2]
     combine = torch.sigmoid(logits.gather(1, selected))
     combine *= 2.5 / (combine.sum(-1, keepdim=True) + 1e-9)
-    expected = torch.zeros(tokens, 192, dtype=torch.float32)
+    expected = torch.zeros(tokens, width, dtype=torch.float32)
     for token in range(tokens):
         for slot in range(2):
             expert_id = selected[token, slot]
@@ -284,11 +290,12 @@ def _check_tp_moe(config, dp_rank, dp_size):
     # applies to this fixed fixture, including output values near zero.
     max_error = (actual.float() - expected).abs().max().item()
     assert max_error < 5e-4, f"BF16 MoE max absolute error: {max_error}"
-    assert actual.shape == (tokens, 192)
+    assert actual.shape == (tokens, width)
 
 
 @pytest.mark.parametrize(("tp_size", "dp_size"), [
     pytest.param(2, 1, marks=multi_gpu_marks(num_gpus=2)),
+    pytest.param(4, 1, marks=multi_gpu_marks(num_gpus=4)),
     pytest.param(6, 1, marks=multi_gpu_marks(num_gpus=6)),
     pytest.param(2, 2, marks=multi_gpu_marks(num_gpus=4)),
 ])
