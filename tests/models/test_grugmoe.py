@@ -809,12 +809,19 @@ def _patch_grug_parallel_runtime(monkeypatch, fake_config, *, is_tpu):
     )
 
 
-def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
-    fake_config = _minimal_vllm_config_for_mode_check(tensor_parallel_size=8)
-    _patch_grug_parallel_runtime(monkeypatch, fake_config, is_tpu=False)
-
-    with pytest.raises(NotImplementedError, match="tensor_parallel_size=1"):
-        _raise_for_unsupported_modes(fake_config)
+@pytest.mark.parametrize("schema,tp_size", [(1, 2), (2, 3), (2, 4), (2, 12)])
+def test_grug_gpu_tp_rejects_unqualified_layouts(monkeypatch, schema, tp_size):
+    """The new Hero modes must not enable unsupported or duplicated layouts."""
+    config = _minimal_vllm_config_for_mode_check(tensor_parallel_size=tp_size)
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(grugmoe_artifact_schema_version=schema),
+        dtype=torch.bfloat16,
+    )
+    _patch_grug_parallel_runtime(monkeypatch, config, is_tpu=False)
+    with pytest.raises(
+        NotImplementedError, match="requires tensor_parallel_size=1|TP1, TP2 and TP6"
+    ):
+        _raise_for_unsupported_modes(config)
 
 
 @pytest.mark.parametrize(
