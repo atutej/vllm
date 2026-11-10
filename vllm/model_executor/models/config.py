@@ -477,6 +477,8 @@ class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
         if (
             vllm_config.parallel_config.disable_custom_all_reduce
             and vllm_config.compilation_config.pass_config.fuse_allreduce_rms is False
+            and not vllm_config.compilation_config.pass_config.enable_sp
+            and not vllm_config.compilation_config.pass_config.fuse_gemm_comms
             and not envs.VLLM_ALLREDUCE_USE_FLASHINFER
             and not envs.VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC
             and not envs.VLLM_ALLREDUCE_USE_SYMM_MEM
@@ -489,7 +491,8 @@ class GrugMoeForCausalLMConfig(VerifyAndUpdateConfig):
             "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=0 "
             "VLLM_ALLREDUCE_USE_SYMM_MEM=0 VLLM_USE_NCCL_SYMM_MEM=0; "
             "pass --disable-custom-all-reduce and set "
-            "pass_config.fuse_allreduce_rms=false in --compilation-config "
+            "pass_config.fuse_allreduce_rms=false, pass_config.enable_sp=false "
+            "and pass_config.fuse_gemm_comms=false in --compilation-config "
             "(merge this into the existing PIECEWISE/ShortConv configuration)."
         )
 

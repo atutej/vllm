@@ -31,14 +31,17 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeShortConv,
     _try_load_grug_expert_weight,
 )
+from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
 from vllm.v1.worker.workspace import init_workspace_manager
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 @pytest.mark.parametrize("conflict", [
     pytest.param(conflict, marks=multi_gpu_marks(num_gpus=2))
     for conflict in (
         None, "defaults", "custom", "fusion", "fusion-default",
+        "sequence-parallel", "gemm-comms",
         "VLLM_ALLREDUCE_USE_FLASHINFER", "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC",
         "VLLM_ALLREDUCE_USE_SYMM_MEM", "VLLM_USE_NCCL_SYMM_MEM",
     )
@@ -69,7 +72,11 @@ def test_hero_tp2_launch_requires_qualified_reductions(tmp_path, monkeypatch, co
         compilation_config={
             "mode": 3, "cudagraph_mode": "PIECEWISE",
             "splitting_ops": ["vllm::grug_moe_short_conv"],
-            "pass_config": {"fuse_allreduce_rms": fusion},
+            "pass_config": {
+                "fuse_allreduce_rms": fusion,
+                "enable_sp": conflict == "sequence-parallel",
+                "fuse_gemm_comms": conflict == "gemm-comms",
+            },
         },
     )
     if conflict is not None:
