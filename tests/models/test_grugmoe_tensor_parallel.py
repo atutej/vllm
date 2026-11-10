@@ -11,13 +11,14 @@ import torch.nn.functional as F
 from torch.multiprocessing import spawn
 
 from tests.utils import multi_gpu_marks
-from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+from vllm.config import CUDAGraphMode, KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -30,7 +31,54 @@ from vllm.model_executor.models.grugmoe import (
     GrugMoeShortConv,
     _try_load_grug_expert_weight,
 )
+from vllm.transformers_utils.configs.grugmoe import GrugMoeConfig
 from vllm.v1.worker.workspace import init_workspace_manager
+
+
+@pytest.mark.parametrize("conflict", [
+    pytest.param(conflict, marks=multi_gpu_marks(num_gpus=2))
+    for conflict in (
+        None, "defaults", "custom", "fusion", "fusion-default",
+        "VLLM_ALLREDUCE_USE_FLASHINFER", "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC",
+        "VLLM_ALLREDUCE_USE_SYMM_MEM", "VLLM_USE_NCCL_SYMM_MEM",
+    )
+])
+def test_hero_tp2_launch_requires_qualified_reductions(tmp_path, monkeypatch, conflict):
+    """Reject launches that could reintroduce the observed cache-state failures."""
+    GrugMoeConfig(
+        architectures=["GrugMoeForCausalLM"], grugmoe_artifact_schema_version=2,
+        vocab_size=384, hidden_size=192, moe_intermediate_size=192,
+        shared_expert_intermediate_size=192, num_experts=12, num_experts_per_tok=2,
+        latent_dim=192, num_hidden_layers=2, num_attention_heads=48,
+        num_key_value_heads=12, local_kv_heads=12, global_kv_heads=6, head_dim=64,
+        max_position_embeddings=512, sliding_window=16, global_every=2,
+        sconv=True, disable_pko=True,
+    ).save_pretrained(tmp_path)
+    for name in (
+        "VLLM_ALLREDUCE_USE_FLASHINFER", "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC",
+        "VLLM_ALLREDUCE_USE_SYMM_MEM", "VLLM_USE_NCCL_SYMM_MEM",
+    ):
+        if conflict == "defaults":
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, "1" if conflict == name else "0")
+    fusion = None if conflict == "fusion-default" else conflict == "fusion"
+    args = EngineArgs(
+        model=str(tmp_path), skip_tokenizer_init=True, dtype="bfloat16",
+        tensor_parallel_size=2, disable_custom_all_reduce=conflict != "custom",
+        compilation_config={
+            "mode": 3, "cudagraph_mode": "PIECEWISE",
+            "splitting_ops": ["vllm::grug_moe_short_conv"],
+            "pass_config": {"fuse_allreduce_rms": fusion},
+        },
+    )
+    if conflict is not None:
+        with pytest.raises(ValueError):
+            args.create_engine_config()
+        return
+    config = args.create_engine_config()
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert not config.compilation_config.pass_config.fuse_allreduce_rms
 
 
 def _load_projection(module, weight):

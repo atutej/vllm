@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -55,6 +56,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.config import GrugMoeForCausalLMConfig
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     extract_layer_index,
@@ -1598,6 +1600,37 @@ class GrugMoeForCausalLM(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         _raise_for_unsupported_modes(vllm_config)
+        if (
+            current_platform.is_cuda()
+            and vllm_config.parallel_config.tensor_parallel_size == 2
+        ):
+            from vllm.distributed.device_communicators.cuda_communicator import (
+                CudaCommunicator,
+            )
+
+            # Configs can cross process/node boundaries after the early check.
+            GrugMoeForCausalLMConfig.verify_tp2_all_reduce_config(vllm_config)
+            communicator = get_tp_group().device_communicator
+            if (
+                not isinstance(communicator, CudaCommunicator)
+                or communicator.pynccl_comm is None
+                or communicator.pynccl_comm.disabled
+                or any(backend is not None for backend in (
+                    communicator.ca_comm, communicator.fi_ar_comm,
+                    communicator.fi_pcie_ipc_ar_comm, communicator.symm_mem_comm,
+                    communicator.qr_comm, communicator.aiter_ar_comm,
+                ))
+            ):
+                raise RuntimeError(
+                    "Hero TP2 did not initialize the qualified NCCL communicator. "
+                    "Apply the required TP2 settings on every node and restart."
+                )
+            logger.info(
+                "Hero TP2 rank %d: verified native NCCL all-reduce; "
+                "custom/FlashInfer/symmetric-memory reductions and "
+                "all-reduce/RMSNorm fusion disabled.",
+                get_tensor_model_parallel_rank(),
+            )
         hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
         if hf_config is None:
             hf_config = vllm_config.model_config.hf_config
