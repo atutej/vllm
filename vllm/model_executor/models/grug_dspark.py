@@ -225,6 +225,9 @@ class GrugDSparkModel(Qwen3DSparkModel):
             device=self._fused_kv_weight.device,
         )
 
+    # TODO: use the `_normalize_context_states` hook from vllm-project/vllm#64111
+    # once the fork is rebased on it, keeping Grug's context epsilon
+    # (`hidden_norm.variance_epsilon`, not the K-norm epsilon).
     def _project_context_kv(
         self,
         context_states: torch.Tensor,

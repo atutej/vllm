@@ -184,7 +184,6 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     supported_architectures = {
         "Qwen3DSparkModel",
         "Qwen3OmniDSparkModel",
-        "GrugDSparkModel",
     }
     selected_architectures = [
         architecture
@@ -193,7 +192,8 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     ]
     # Legacy msModelSpec checkpoints use a training-only architecture name.
     pre_trained_config["architectures"] = selected_architectures or ["Qwen3DSparkModel"]
-    if config_dict.get("layer_type") == "grug":
+    layer_type = config_dict.get("layer_type", "qwen3")
+    if layer_type == "grug":
         # Grug-style draft layers (speculators `layer_type="grug"`): the backbone
         # differs from Qwen3, the rest of the DSpark runtime is shared.
         pre_trained_config["architectures"] = ["GrugDSparkModel"]
@@ -205,6 +205,10 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
         ):
             if config_dict.get(key) is not None:
                 pre_trained_config[key] = config_dict[key]
+    elif layer_type != "qwen3":
+        raise ValueError(
+            f"Unsupported DSpark layer_type {layer_type!r}; expected 'qwen3' or 'grug'"
+        )
 
     sample_from_anchor = config_dict.get("sample_from_anchor", False)
     pre_trained_config["sample_from_anchor"] = sample_from_anchor
